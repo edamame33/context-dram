@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.sqlite3
+*.bak
+.cursor_*
+.poweroff_epoch
+.uptime
