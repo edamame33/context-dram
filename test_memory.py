@@ -2,7 +2,10 @@
 
 Run:  py -3.13 test_memory.py
 """
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from memory import (Config, Memory, effective_charge, tier_for)
 
@@ -92,12 +95,34 @@ class TestMemory(unittest.TestCase):
         self.assertAlmostEqual(self.m.get(cid).eff_charge(9, E), 1.0, places=6)
 
     def test_page_in_respects_token_budget(self):
-        # five cells, ~100 tokens of body each (400 chars), all hot at turn 0
+        # five cells, ~100 tokens of body each (400 chars), all hot at turn 0.
+        # The budget invariant must hold; with the fairness cap active, oversized
+        # cells arrive as title-only stubs, so the count may exceed the uncapped 3.
         for i in range(5):
             self._w(f"cell {i}", body="z" * 400, turn=0)
         out = self.m.page_in("proj", now_turn=0, now_epoch=E, budget=250)
-        self.assertLessEqual(len(out), 3)
         self.assertLessEqual(sum(c.est_tokens() for c in out), 250)
+
+    def test_page_in_uncapped_matches_legacy_selection(self):
+        m = Memory(cfg=Config(cell_budget_frac=None))
+        for i in range(5):
+            m.write(type="fact", title=f"cell {i}", body="z" * 400,
+                    session_id="s", project="proj", now_turn=0, now_epoch=E)
+        out = m.page_in("proj", now_turn=0, now_epoch=E, budget=250)
+        self.assertLessEqual(len(out), 3)          # legacy greedy fill, whole cells
+        self.assertLessEqual(sum(c.est_tokens() for c in out), 250)
+        m.close()
+
+    def test_page_in_giant_cell_cannot_starve_topics(self):
+        # one ~500-token monster plus small cells: the cap demotes the monster
+        # to a stub so the small cells still page in
+        self._w("monster", body="z" * 2000, turn=0)
+        small = [self._w(f"small {i}", body="z" * 40, turn=0) for i in range(3)]
+        out = self.m.page_in("proj", now_turn=0, now_epoch=E, budget=300)
+        got = {c.id for c in out}
+        for cid in small:
+            self.assertIn(cid, got)
+        self.assertLessEqual(sum(c.est_tokens() for c in out), 300)
 
     def test_page_in_orders_by_charge(self):
         self._w("older", turn=0)           # will have decayed more by turn 6
@@ -135,6 +160,152 @@ class TestMemory(unittest.TestCase):
         a = self._w("trading signal logic", files=["strat.py"], concepts=["trading"], turn=0)
         b = self._w("gpu cracking rig", files=["hashcat.conf"], concepts=["cracking"], turn=0)
         self.assertNotEqual(self.m.get(a).topic_id, self.m.get(b).topic_id)
+
+
+class TestRobustnessUpgrades(unittest.TestCase):
+    """Regression locks for the faster+bulletproof upgrade pass."""
+
+    def setUp(self):
+        self.m = Memory(":memory:", Config(half_life_turns=7))
+
+    def _w(self, title, **kw):
+        kw.setdefault("body", "x")
+        return self.m.write(type="fact", title=title, session_id="s1",
+                            project="proj", now_turn=kw.pop("turn", 0),
+                            now_epoch=E, **kw)
+
+    # -- recall-hardening ----------------------------------------------------
+    def test_recall_survives_fts_special_chars(self):
+        self._w("license-check at 0x4A2F", concepts=["license"])
+        for q in ['license-check', '"unbalanced', 'a AND b', '(paren', 'a OR', 'NOT x']:
+            with self.subTest(q=q):
+                self.m.recall(q, project="proj", now_turn=0, now_epoch=E)  # must not raise
+
+    def test_recall_empty_query_returns_empty(self):
+        self._w("something")
+        self.assertEqual(self.m.recall("   ", project="proj"), [])
+
+    def test_recall_offset_query_hits(self):
+        self._w("Frida inline hook at offset 0x4A2F")
+        hits = self.m.recall("0x4A2F", project="proj", now_turn=0, now_epoch=E)
+        self.assertGreaterEqual(len(hits), 1)
+
+    def test_non_fts_fallback_respects_project(self):
+        # force the LIKE path and prove the project filter binds (was a precedence bug)
+        self.m.fts_enabled = False
+        self._w("shared title token QZ", concepts=["x"])
+        self.m.write(type="fact", title="shared title token QZ", body="y",
+                     session_id="s1", project="other", now_turn=0, now_epoch=E)
+        hits = self.m.recall("QZ", project="proj", now_turn=0, now_epoch=E)
+        self.assertEqual(len(hits), 1)   # only the 'proj' cell, not 'other'
+
+    # -- distiller noise gate + payload-aware dedup --------------------------
+    def test_distinct_turns_same_title_do_not_collide(self):
+        a = self._w("update", files=["a.py"])
+        b = self._w("update", files=["b.py"])   # same title, different evidence
+        self.assertNotEqual(a, b)
+        n = self.m.db.execute("SELECT COUNT(*) n FROM cells").fetchone()["n"]
+        self.assertEqual(n, 2)
+
+    # -- cell_files junction: reliable refresh incl. Windows paths -----------
+    def test_touch_by_windows_path_refreshes(self):
+        cid = self._w("edits a module", files=[r"C:\proj\auth.py"])
+        touched = self.m.touch_by_file([r"C:\proj\auth.py"], now_turn=9, now_epoch=E)
+        self.assertIn(cid, touched)
+
+    def test_touch_by_file_no_superstring_false_positive(self):
+        cid = self._w("edits auth", files=["auth.py"])
+        touched = self.m.touch_by_file(["h.py"], now_turn=9, now_epoch=E)  # substring of auth.py
+        self.assertNotIn(cid, touched)
+
+    # -- session-scoped turn decay ------------------------------------------
+    def test_cross_session_uses_epoch_not_turn(self):
+        # a cell written in session A at turn 40; a new session B starts at turn 0.
+        # Turn decay must NOT fire (40 > 0 would clamp), only epoch aging applies.
+        cid = self.m.write(type="fact", title="cross", body="x", session_id="A",
+                           project="proj", now_turn=40, now_epoch=E)
+        c = self.m.get(cid)
+        same_epoch = c.eff_charge(0, E, now_session="B")
+        self.assertAlmostEqual(same_epoch, 1.0, places=6)   # no turn decay across sessions
+
+    def test_same_session_turn_decay_still_applies(self):
+        cid = self.m.write(type="fact", title="intra", body="x", session_id="A",
+                           project="proj", now_turn=0, now_epoch=E)
+        c = self.m.get(cid)
+        self.assertAlmostEqual(c.eff_charge(7, E, now_session="A"), 0.5, places=4)
+
+    # -- neighbor-boost epoch write -----------------------------------------
+    def test_neighbor_boost_persists_across_session_gap(self):
+        a = self.m.write(type="fact", title="entry", body="x", files=["m.py"],
+                         concepts=["m"], session_id="A", project="proj",
+                         now_turn=0, now_epoch=E)
+        b = self.m.write(type="fact", title="near", body="x", files=["m.py"],
+                         concepts=["m"], session_id="A", project="proj",
+                         now_turn=0, now_epoch=E)
+        self.assertEqual(self.m.get(a).topic_id, self.m.get(b).topic_id)
+        later = E + 3 * 86400
+        pre = self.m.get(b).eff_charge(0, later, now_session="B")
+        self.m.refresh([a], now_turn=0, now_epoch=later, session_id="B")  # boost b
+        post = self.m.get(b).eff_charge(0, later, now_session="B")
+        self.assertGreater(post, pre)   # boost is a gain, not epoch-decayed away
+
+    # -- atomic capture ------------------------------------------------------
+    def test_capture_turn_is_atomic_and_touches(self):
+        seed = self._w("existing", files=["shared.py"])
+        cid = self.m.capture_turn(type="fact", title="new work",
+                                  files=["shared.py"], files_touched=["shared.py"],
+                                  session_id="s1", project="proj", now_turn=3,
+                                  now_epoch=E)
+        self.assertTrue(cid)
+        self.assertEqual(self.m.get(seed).refresh_count, 1)  # neighbor/file touch landed
+
+    # -- maintenance: lossless archive prune --------------------------------
+    def test_maintenance_prunes_archived_and_exports(self):
+        cid = self._w("will archive", turn=0)
+        pin = self.m.write(type="fact", title="pinned header", body="x",
+                           session_id="s1", project="proj", now_turn=0,
+                           now_epoch=E, pinned=True)
+        sidecar = Path(tempfile.mkdtemp()) / "archived.jsonl"
+        far = E + 999 * 86400   # far future -> the unpinned cell is long-idle ARCHIVED
+        rep = self.m.maintenance(now_turn=0, now_epoch=far, archive_after_days=30,
+                                 sidecar_path=str(sidecar))
+        self.assertEqual(rep["pruned"], 1)
+        self.assertIsNone(self.m.get(cid))          # deleted
+        self.assertIsNotNone(self.m.get(pin))       # pinned survives
+        lines = sidecar.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lines), 1)             # exported before delete
+        json.loads(lines[0])                        # valid JSON row
+
+    def test_fts_selfheal_rebuilds_on_reopen(self):
+        db = Path(tempfile.mkdtemp()) / "cells.sqlite3"
+        m1 = Memory(str(db))
+        m1.write(type="fact", title="findme token PLUTO", body="x",
+                 session_id="s", project="proj", now_turn=0, now_epoch=E)
+        m1.close()
+        m2 = Memory(str(db))                         # reopen -> self-heal path
+        hits = m2.recall("PLUTO", project="proj", now_turn=0, now_epoch=E)
+        m2.close()
+        self.assertGreaterEqual(len(hits), 1)
+
+
+class TestChargeProperties(unittest.TestCase):
+    """Property checks on the pure decay function (deterministic pseudo-random)."""
+
+    def test_charge_bounded_and_monotone_in_time(self):
+        # LCG so the test is dependency-free and reproducible
+        seed = 12345
+        for _ in range(4000):
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            stored = (seed % 1000) / 1000.0
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            ut = seed % 50
+            seed = (1103515245 * seed + 12345) & 0x7FFFFFFF
+            nt = ut + (seed % 50)
+            c1 = effective_charge(stored, ut, E, nt, E)
+            c2 = effective_charge(stored, ut, E, nt, E + 86400)  # one day later
+            self.assertTrue(0.0 <= c1 <= 1.0)
+            self.assertTrue(0.0 <= c2 <= 1.0)
+            self.assertLessEqual(c2, c1 + 1e-9)   # more elapsed time never raises charge
 
 
 if __name__ == "__main__":

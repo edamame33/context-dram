@@ -8,14 +8,17 @@ Behavior by source:
 
 Decay: CLAUDE_SCRATCHPAD_TTL_HOURS controls eviction (default "shutdown").
   - "shutdown": reset only on a full power-off; survives sleep AND restart.
-                Windows-only (reads the System event log); on macOS/Linux it
-                behaves like "session" - set "session" or an integer there.
+                Windows-only (reads the System event log via wevtutil); on
+                macOS/Linux it behaves like "session" and says so once.
   - "session" : never decay; only an explicit /clear evicts.
   - <int>     : legacy - decay files older than N hours.
+
+Set CLAUDE_SCRATCHPAD_DEBUG=1 to log swallowed failures to
+<scratchpad>/.errors.log.
 """
-import ctypes
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -56,6 +59,50 @@ else:
         DECAY_MODE, TTL_HOURS = "hours", 24
 MAX_PRIME_CHARS = 8000  # ~2000 tokens injected
 
+DEBUG = os.environ.get("CLAUDE_SCRATCHPAD_DEBUG") == "1"
+HOOK_NAME = "scratch_prime"
+
+
+def _err(phase: str, exc: BaseException, sid: str = "") -> None:
+    """One line per swallowed failure; never raises, no-op unless DEBUG."""
+    if not DEBUG:
+        return
+    try:
+        d = _scratchpad_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / ".errors.log"
+        try:
+            if p.exists() and p.stat().st_size > 262144:
+                tail = p.read_bytes()[-65536:]
+                tmp = p.with_name(".errors.log.tmp")
+                tmp.write_bytes(tail)
+                os.replace(tmp, p)
+        except OSError:
+            pass
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"{ts}Z {HOOK_NAME} {phase} s={sid} "
+                    f"{type(exc).__name__}: {str(exc)[:200]}\n")
+    except Exception:
+        pass
+
+
+def _read_stdin_json():
+    """Tolerant stdin read - hooks may receive UTF-8, a BOM, or UTF-16."""
+    try:
+        raw = sys.stdin.buffer.read()
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    for enc in ("utf-8-sig", "utf-16", "utf-8"):
+        try:
+            return json.loads(raw.decode(enc))
+        except Exception:
+            continue
+    _err("stdin-parse", ValueError("undecodable hook payload"))
+    return {}
+
 
 def _wipe_all():
     """Delete every scratchpad file (the RAM-layer reset)."""
@@ -64,8 +111,8 @@ def _wipe_all():
     for f in list(SCRATCHPAD_DIR.glob("*.md")) + list(SCRATCHPAD_DIR.glob(".cursor_*")):
         try:
             f.unlink()
-        except Exception:
-            pass
+        except Exception as e:
+            _err("wipe", e)
 
 
 def ttl_sweep():
@@ -80,8 +127,12 @@ def ttl_sweep():
                 cursor = SCRATCHPAD_DIR / f".cursor_{f.stem}"
                 if cursor.exists():
                     cursor.unlink()
-        except Exception:
-            pass
+        except Exception as e:
+            _err("wipe", e)
+
+
+_EVENT_ID = re.compile(r"<EventID[^>]*>(\d+)</EventID>")
+_RECORD_ID = re.compile(r"<EventRecordID>(\d+)</EventRecordID>")
 
 
 def _last_poweroff_id():
@@ -90,81 +141,84 @@ def _last_poweroff_id():
     True power-off = Event 1074 whose message says 'power off' (user chose Shut down),
     or Event 6008 (dirty/unexpected shutdown - the box lost power). A *restart* logs
     1074 with 'restart' and is ignored on purpose, so restarts never reset the pad.
+
+    Uses wevtutil (native, ~30ms) instead of a powershell.exe pipeline (~300ms+).
+    XML output is required: the text format omits EventRecordID entirely.
     """
-    ps = (
-        "$ErrorActionPreference='SilentlyContinue';"
-        "$e = Get-WinEvent -FilterHashtable @{LogName='System';Id=1074,6008} -MaxEvents 40;"
-        "$p = $e | Where-Object { $_.Id -eq 6008 -or ($_.Id -eq 1074 -and $_.Message -match 'power off') } |"
-        " Sort-Object RecordId -Descending | Select-Object -First 1;"
-        "if ($p) { $p.RecordId }"
-    )
     try:
         r = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True,
-            text=True,
-            timeout=8,
+            ["wevtutil", "qe", "System",
+             "/q:*[System[(EventID=1074 or EventID=6008)]]",
+             "/c:40", "/rd:true", "/f:xml"],
+            capture_output=True, text=True, timeout=8,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        out = (r.stdout or "").strip()
-        return int(out) if out.isdigit() else None
-    except Exception:
-        return None
-
-
-def _uptime_ms():
-    """Milliseconds since boot (resets to ~0 on every reboot). None off-Windows."""
-    try:
-        k = ctypes.windll.kernel32
-        k.GetTickCount64.restype = ctypes.c_uint64
-        return int(k.GetTickCount64())
+        best = None
+        for block in (r.stdout or "").split("</Event>"):
+            em = _EVENT_ID.search(block)
+            rm = _RECORD_ID.search(block)
+            if not em or not rm:
+                continue
+            eid = int(em.group(1))
+            if eid == 6008 or (eid == 1074 and "power off" in block.lower()):
+                rid = int(rm.group(1))
+                best = rid if best is None else max(best, rid)
+        return best
     except Exception:
         return None
 
 
 def _poweroff_reset_check():
-    """Authoritative power-off comparison. Wipes the pad once if a NEW full power-off
-    has appeared since the .poweroff_epoch marker. First run only baselines."""
+    """Authoritative power-off comparison against the .poweroff_epoch marker.
+
+    Rules (each one closes a verified data-destruction or dead-sweep path):
+      - query failed (rid None): NO INFORMATION - keep the pad, do NOT touch
+        the marker (writing 'none' used to poison it and wipe on recovery)
+      - first run (no marker): baseline only, never wipe
+      - rid > prev: a NEW power-off appeared - wipe once, advance the marker
+      - rid == prev: same power session - keep the pad
+      - rid < prev: the System log was cleared and RecordIds restarted -
+        re-baseline downward WITHOUT wiping (otherwise the sweep goes dead
+        until RecordIds catch back up)
+    """
     rid = _last_poweroff_id()
-    cur = str(rid) if rid is not None else "none"
+    if rid is None:
+        return
     marker = SCRATCHPAD_DIR / ".poweroff_epoch"
     try:
         prev = marker.read_text(encoding="utf-8").strip()
     except Exception:
         prev = ""
-    if prev == cur:
-        return  # nothing changed since last session -> keep the pad
-    if prev != "" and rid is not None:
-        _wipe_all()  # a NEW full power-off appeared since last session -> reset
+    if prev.isdigit():
+        if rid > int(prev):
+            _wipe_all()
+        elif rid == int(prev):
+            return                      # marker already current; skip the write
     try:
-        marker.write_text(cur, encoding="utf-8")
-    except Exception:
-        pass
+        marker.write_text(str(rid), encoding="utf-8")
+    except Exception as e:
+        _err("marker", e)
 
 
 def shutdown_sweep():
     """Reset the pad once per full power-off; survive sleep and restart.
 
-    Fast path: within a single boot a power-off is physically impossible, so if
-    uptime shows we are still in the same boot as the last check, skip the
-    (subprocess) event-log query entirely. Only a reboot runs the authoritative
-    check, which ignores restarts and resets only on a true power-off.
+    On non-Windows platforms there is no System event log to consult, so
+    'shutdown' honestly degrades to 'session' (never decay) and says so once.
     """
     if not SCRATCHPAD_DIR.exists():
         return
-    up = _uptime_ms()
-    if up is not None:
-        umark = SCRATCHPAD_DIR / ".uptime"
-        try:
-            prev_up = int(umark.read_text(encoding="utf-8").strip())
-        except Exception:
-            prev_up = None
-        try:
-            umark.write_text(str(up), encoding="utf-8")
-        except Exception:
-            pass
-        if prev_up is not None and up >= prev_up:
-            return  # same power session -> no power-off possible -> keep pad (fast)
+    if os.name != "nt":
+        sentinel = SCRATCHPAD_DIR / ".platform_warned"
+        if not sentinel.exists():
+            try:
+                sentinel.write_text("", encoding="utf-8")
+            except Exception:
+                pass
+            print("(scratchpad: TTL mode 'shutdown' is Windows-only; "
+                  "behaving as 'session'. Set CLAUDE_SCRATCHPAD_TTL_HOURS "
+                  "to 'session' or an hour count to silence this.)")
+        return
     _poweroff_reset_check()
 
 
@@ -190,11 +244,7 @@ def emit(label, content):
 
 
 def main():
-    try:
-        payload = json.load(sys.stdin)
-    except Exception:
-        return
-
+    payload = _read_stdin_json()
     session_id = payload.get("session_id") or ""
     cwd = payload.get("cwd", "")
     source = payload.get("source", "startup")
@@ -222,8 +272,8 @@ def main():
         if own.exists():
             try:
                 emit("resumed session", own.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+            except Exception as e:
+                _err("prime-read", e, session_id)
             return
 
     candidates = sorted(
@@ -234,17 +284,20 @@ def main():
     for f in candidates:
         try:
             head = f.read_text(encoding="utf-8")[:800]
-            if cwd and cwd in head:
+            # line-anchored frontmatter match: a bare substring test wrongly
+            # recalled C:\proj2's pad for a session in C:\proj
+            if cwd and f"\ncwd: {cwd}\n" in head:
                 age_h = (time.time() - f.stat().st_mtime) / 3600
                 emit(f"most recent in this cwd, {age_h:.1f}h ago", f.read_text(encoding="utf-8"))
                 return
-        except Exception:
+        except Exception as e:
+            _err("prime-read", e, session_id)
             continue
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        pass
+    except Exception as e:
+        _err("top", e)
     sys.exit(0)

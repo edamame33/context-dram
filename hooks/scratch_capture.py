@@ -2,8 +2,17 @@
 
 Captures: user prompt, tool calls made, assistant response (truncated).
 Writes to: $CLAUDE_SCRATCHPAD_DIR (default ~/.claude/scratchpad/${session_id}.md).
-Never crashes the session — all exceptions exit 0.
+Never crashes the session — all exceptions exit 0; set CLAUDE_SCRATCHPAD_DEBUG=1
+to log swallowed failures to <scratchpad>/.errors.log.
+
+Runs synchronously and inline: for the overwhelmingly common transcript size
+(< ~3.5 MB) the parse+append is single-digit milliseconds, cheaper than paying
+a second Python interpreter to do it detached. Only pathologically large
+transcripts (16k+ turns) make the inline parse costly; if that ever bites, mark
+this hook "async": true in settings.json so it leaves the blocking path
+entirely, rather than spawning a duplicate interpreter per turn.
 """
+import hashlib
 import json
 import os
 import sys
@@ -28,6 +37,50 @@ MAX_USER_CHARS = 600
 MAX_ASST_CHARS = 1000
 MAX_TOOL_ARG_CHARS = 240
 
+DEBUG = os.environ.get("CLAUDE_SCRATCHPAD_DEBUG") == "1"
+HOOK_NAME = "scratch_capture"
+
+
+def _err(phase: str, exc: BaseException, sid: str = "") -> None:
+    """One line per swallowed failure; never raises, no-op unless DEBUG."""
+    if not DEBUG:
+        return
+    try:
+        d = _scratchpad_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / ".errors.log"
+        try:
+            if p.exists() and p.stat().st_size > 262144:
+                tail = p.read_bytes()[-65536:]
+                tmp = p.with_name(".errors.log.tmp")
+                tmp.write_bytes(tail)
+                os.replace(tmp, p)
+        except OSError:
+            pass
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(f"{ts}Z {HOOK_NAME} {phase} s={sid} "
+                    f"{type(exc).__name__}: {str(exc)[:200]}\n")
+    except Exception:
+        pass
+
+
+def _read_stdin_json():
+    """Tolerant stdin read - hooks may receive UTF-8, a BOM, or UTF-16."""
+    try:
+        raw = sys.stdin.buffer.read()
+    except Exception:
+        return {}
+    if not raw:
+        return {}
+    for enc in ("utf-8-sig", "utf-16", "utf-8"):
+        try:
+            return json.loads(raw.decode(enc))
+        except Exception:
+            continue
+    _err("stdin-parse", ValueError("undecodable hook payload"))
+    return {}
+
 
 def extract_text(msg):
     """Pull the text content out of a transcript message."""
@@ -51,8 +104,11 @@ def extract_tool_calls(msg):
 
 
 def is_real_user_message(msg):
-    """True only for messages that are an actual user prompt (not a tool_result wrapped as user)."""
+    """True only for messages that are an actual user prompt (not a tool_result
+    wrapped as user, not an injected meta row, not a compaction summary)."""
     if (msg.get("type") or msg.get("role")) != "user":
+        return False
+    if msg.get("isMeta") or msg.get("isCompactSummary"):
         return False
     content = msg.get("message", {}).get("content")
     if isinstance(content, str):
@@ -88,11 +144,7 @@ def summarize_tool(tool):
 
 
 def main():
-    try:
-        payload = json.load(sys.stdin)
-    except Exception:
-        return
-
+    payload = _read_stdin_json()
     session_id = payload.get("session_id") or "unknown"
     transcript_path = payload.get("transcript_path")
     cwd = payload.get("cwd", "")
@@ -104,8 +156,9 @@ def main():
         return
 
     msgs = []
+    n_prompts = 0
     try:
-        with open(tpath, encoding="utf-8") as f:
+        with open(tpath, encoding="utf-8", errors="replace") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -114,13 +167,15 @@ def main():
                     msgs.append(json.loads(line))
                 except Exception:
                     continue
-    except Exception:
+    except Exception as e:
+        _err("tx-open", e, session_id)
         return
 
     last_user_idx = -1
     for i, m in enumerate(msgs):
         if is_real_user_message(m):
             last_user_idx = i
+            n_prompts += 1
 
     last_user = msgs[last_user_idx] if last_user_idx >= 0 else None
     asst_msgs = [
@@ -134,9 +189,16 @@ def main():
     for am in asst_msgs:
         last_tools.extend(extract_tool_calls(am))
 
+    asst_text_full = extract_text(last_asst)
     SCRATCHPAD_DIR.mkdir(parents=True, exist_ok=True)
     cursor = SCRATCHPAD_DIR / f".cursor_{session_id}"
     asst_uuid = last_asst.get("uuid") or last_asst.get("message", {}).get("id", "")
+    if not asst_uuid:
+        # a transcript without uuids must still dedup turn-by-turn; an empty
+        # key would compare equal to every later empty key and silently drop
+        # every turn after the first
+        asst_uuid = "h:" + hashlib.sha256(
+            f"{n_prompts}|{asst_text_full[:500]}".encode()).hexdigest()[:24]
 
     if cursor.exists():
         try:
@@ -146,35 +208,39 @@ def main():
             pass
 
     user_text = extract_text(last_user).strip().replace("\n", " ")[:MAX_USER_CHARS] if last_user else ""
-    asst_text = extract_text(last_asst).strip().replace("\n", " ")[:MAX_ASST_CHARS]
+    asst_text = asst_text_full.strip().replace("\n", " ")[:MAX_ASST_CHARS]
     tool_lines = [f"  - {summarize_tool(t)}" for t in last_tools]
 
     scratch = SCRATCHPAD_DIR / f"{session_id}.md"
     is_new = not scratch.exists()
-    with open(scratch, "a", encoding="utf-8") as f:
-        if is_new:
-            f.write(
-                f"---\nsession_id: {session_id}\ncwd: {cwd}\n"
-                f"started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n---\n\n"
-            )
-        ts = time.strftime("%H:%M:%S")
-        f.write(f"## [{ts}]\n")
-        if user_text:
-            f.write(f"**User:** {user_text}\n\n")
-        if tool_lines:
-            f.write("**Tools:**\n" + "\n".join(tool_lines) + "\n\n")
-        if asst_text:
-            f.write(f"**Asst:** {asst_text}\n\n")
+    try:
+        with open(scratch, "a", encoding="utf-8") as f:
+            if is_new:
+                f.write(
+                    f"---\nsession_id: {session_id}\ncwd: {cwd}\n"
+                    f"started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n---\n\n"
+                )
+            ts = time.strftime("%H:%M:%S")
+            f.write(f"## [{ts}]\n")
+            if user_text:
+                f.write(f"**User:** {user_text}\n\n")
+            if tool_lines:
+                f.write("**Tools:**\n" + "\n".join(tool_lines) + "\n\n")
+            if asst_text:
+                f.write(f"**Asst:** {asst_text}\n\n")
+    except Exception as e:
+        _err("md-append", e, session_id)
+        return
 
     try:
         cursor.write_text(asst_uuid, encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as e:
+        _err("cursor-write", e, session_id)
 
 
 if __name__ == "__main__":
     try:
         main()
-    except Exception:
-        pass
+    except Exception as e:
+        _err("top", e)
     sys.exit(0)

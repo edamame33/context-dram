@@ -67,6 +67,28 @@ See [INSTALL.md](INSTALL.md). Short version: register four hooks in `~/.claude/s
 
 Everything stays local. `CLAUDE_SCRATCHPAD_DIR` sets the scratchpad root (default `~/.claude/scratchpad`); the cell DB sits next to it at `<scratchpad>/memory/cells.sqlite3` (override: `CDRAM_DB_DIR`). This repo contains tooling only — captured transcripts and cells are never written inside it, and `.gitignore` excludes them belt-and-braces.
 
+## What's hardened
+
+The store and hooks are built to survive real-world edge cases rather than assume the happy path:
+
+- **Concurrent-safe writes.** WAL + `synchronous=NORMAL`, `INSERT ... ON CONFLICT DO NOTHING`, and a `BEGIN IMMEDIATE` capture transaction, so two sessions' background workers can't drop a cell or half-apply a turn when they collide.
+- **Session-scoped decay.** Turn decay applies only within a session; cross-session aging is wall-clock only. The turn clock resets to 0 each session, so comparing turn numbers across sessions (the old behavior) silently mis-aged cells.
+- **Bounded growth.** A background maintenance pass (every ~20th capture) sweeps tiers, exports long-idle archived cells to an fsync'd JSONL sidecar *before* deleting them (lossless), prunes orphan topic rows, and VACUUMs periodically.
+- **Exact recall.** FTS queries are sanitized into phrase tokens so a search containing `-`, `(`, or an unbalanced quote can't raise; a file→cell junction table replaces a full-table `LIKE` scan (and fixes Windows-path cells that never refreshed); startup recall matches the working directory exactly instead of by substring (a session in `C:\proj` no longer inherits `C:\proj2`'s scratchpad).
+- **Tolerant I/O.** Every hook reads stdin as UTF-8 / UTF-8-BOM / UTF-16, and transcripts decode with `errors="replace"` so one corrupt byte drops one line, not the whole turn.
+- **Observability.** Set `CLAUDE_SCRATCHPAD_DEBUG=1` to append one line per swallowed failure to `<scratchpad>/.errors.log` (size-capped, zero cost when off) — so "it silently did nothing" becomes diagnosable.
+- **Honest cross-platform.** The `shutdown` power-off detection is Windows-only; on macOS/Linux it says so once and behaves as `session`.
+
+## Environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CLAUDE_SCRATCHPAD_DIR` | `~/.claude/scratchpad` | transcripts + cell DB root |
+| `CLAUDE_SCRATCHPAD_TTL_HOURS` | `shutdown` | `shutdown` (reset on power-off, Windows-only), `session` (never), or an integer (N-hour TTL) |
+| `CDRAM_DB_DIR` | `<scratchpad>/memory` | cell DB location override |
+| `CLAUDE_SCRATCHPAD_DEBUG` | unset | `1` logs swallowed failures to `<scratchpad>/.errors.log` |
+| `CDRAM_CAPTURE_ALL` | unset | `1` disables the noise gate (capture every turn, including filler) |
+
 ## Config knobs (memory.Config)
 
 | knob | default | meaning |
@@ -99,9 +121,11 @@ python3 prune_lines.py    # age-stub + compact-collapse. Dry-run default, .bak b
 ## Run the tests
 
 ```
-python3 -m unittest discover -v      # or: py -3.13 -m unittest discover -v
-python3 memory.py                    # prints the discharge-curve demo
+python3 -m unittest discover -p "test_*.py" -v   # 82 tests (or: py -3.13 ...)
+python3 memory.py                                # prints the discharge-curve demo
 ```
+
+CI runs the same suite plus `ruff` on Windows and Linux across Python 3.10 and 3.13 (`.github/workflows/ci.yml`). The subprocess integration tests in `test_hooks_subprocess.py` spawn the real hook scripts with synthetic stdin and redirected output dirs, so nothing touches live data.
 
 ## Open ends
 

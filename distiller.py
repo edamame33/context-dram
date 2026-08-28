@@ -52,11 +52,37 @@ def classify_type(text: str) -> str:
     return "fact"
 
 
+_ACK_LINE = re.compile(
+    r"^(sure|done|okay|ok|perfect|great|sounds good|will do|got it|on it)\b[.! ]*$",
+    re.IGNORECASE)
+
+
 def title_of(text: str, limit: int = 90) -> str:
+    """First evidence-bearing line wins; else the first real line.
+
+    Skips code-fence bodies and pure-acknowledgement lines, and prefers a line
+    carrying an identifier / path / hex offset - those are the recall keys.
+    """
+    first_real = None
+    in_fence = False
     for raw in text.splitlines():
-        s = raw.strip().lstrip("#*->•- ").strip()
-        if len(s) >= 8 and not s.startswith("```"):
+        stripped = raw.strip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        s = stripped.lstrip("#*->•- ").strip()
+        if len(s) < 8:
+            continue
+        if _ACK_LINE.match(s):
+            continue
+        if first_real is None:
+            first_real = s
+        if _OFFSET.search(s) or _WIN_PATH.search(s) or _FILE.search(s) or _IDENT.search(s):
             return s[:limit]
+    if first_real is not None:
+        return first_real[:limit]
     return text.strip()[:limit] or "untitled"
 
 
